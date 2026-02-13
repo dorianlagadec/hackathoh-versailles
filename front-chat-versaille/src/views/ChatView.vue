@@ -1,18 +1,28 @@
 <template>
   <div class="main-layout-container" :class="{ 'map-is-open': isMapOpen }">
     <div id="chat-container">
-      <header class="chat-header">
-        <h1>Le Scribe Royal</h1>
-        <p>Votre humble serviteur digital</p>
+      <header class="chat-header" :style="{ backgroundImage: `url(${headerImg})` }">
+        <span class="chat-title">Feels like Royalty</span>
         <button @click="newConversation" class="new-chat-btn">
-          Nouvelle Conversation
+          New conversations
         </button>
         <button @click="toggleMap" class="map-toggle-btn">
           {{ isMapOpen ? "Fermer la Carte" : "Ouvrir la Carte" }}
         </button>
+        <!-- Persona selection dropdown added here -->
+         <select v-model="persona" class="persona-select">
+          <option v-for="p in personas" :key="p.value" :value="p.value">
+            {{ p.label }}
+          </option>
+         </select>
       </header>
       <MessageDisplay :messages="messages" />
-      <UserInput @send-message="handleNewMessage" />
+      <div class="input-bar">
+        <UserInput @send-message="handleNewMessage" />
+        <button class="mic-btn" @click="toggleRecording">
+          {{ isRecording ? "■ Stop" : "🎤 Talk" }}
+        </button>
+      </div>
     </div>
 
     <div class="map-area" :class="{ 'is-open': isMapOpen }">
@@ -43,6 +53,7 @@
 </template>
 
 <script setup>
+import headerImg from '@/assets/header-chateau-versailles.png'
 import MessageDisplay from "@/components/MessageDisplay.vue";
 import UserInput from "@/components/UserInput.vue";
 import MapDisplay from "@/components/MapDisplay.vue";
@@ -51,7 +62,6 @@ import { useRouter } from "vue-router";
 
 const emit = defineEmits(["conversation-updated"]);
 
-// --- Props and Router ---
 const props = defineProps({
   uuid: {
     type: String,
@@ -60,21 +70,21 @@ const props = defineProps({
 });
 const router = useRouter();
 
-// --- Reactive State ---
 const isMapOpen = ref(false);
-
 const routeJson = ref(null);
 const selectedLegIndex = ref(0);
 const messages = ref([]);
 
-const apiKey = import.meta.env.VITE_MISTRAL_API_KEY;
-// --- CHANGE ---
-// Using a relative path for the API. Nginx will proxy any request starting with /api/
-// to the backend service defined in your nginx.conf.
-//const backendApiUrl = "https://hackversailles-13-deus.ngrok.app/api";
-const backendApiUrl = "http://localhost:8000";
+const backendApiUrl = import.meta.env.VITE_API_BASE_URL || window.location.origin;
 
-// --- Functions ---
+const personas = [
+  { value: "default", label: "Neutral" },
+  { value: "marie_antoinette", label: "Marie-Antoinette" },
+  { value: "louis_xiv", label: "Louis XIV" },
+];
+const persona = ref(localStorage.getItem("persona") || "default");
+watch(persona, (v) => localStorage.setItem("persona", v));
+
 const selectLeg = (index) => {
   selectedLegIndex.value = index;
 };
@@ -96,11 +106,9 @@ const currentLegDetails = computed(() => {
   };
 });
 
-// --- Conversation Memory Functions ---
 const loadConversation = async () => {
   messages.value = [];
   try {
-    // This will now correctly resolve to https://<your-ngrok-url>/api/v1/conversations/...
     const response = await fetch(
       `${backendApiUrl}/v1/conversations/${props.uuid}`
     );
@@ -137,101 +145,146 @@ const saveConversation = async () => {
 };
 
 const handleNewMessage = async (newMessageText) => {
-  messages.value.push({
-    id: Date.now(),
-    text: newMessageText,
-    sender: "user",
-  });
-
-  if (!apiKey) {
-    messages.value.push({
-      id: Date.now() + 1,
-      text: "Hélas, la clé API de Mistral n'est pas configurée côté client.",
-      sender: "bot",
-    });
-
+  // 1) add user message
+  messages.value.push({ id: Date.now(), text: newMessageText, sender: "user" });
+  if (messages.value.length === 1) {
     await saveConversation();
-    emit("conversation-updated");
-    return;
+    
   }
-
-  const apiMessages = messages.value.map((msg) => ({
-    role: msg.sender === "bot" ? "assistant" : "user",
-    content: msg.text,
+  // 2) build OpenAI-style history
+  const apiMessages = messages.value.map((m) => ({
+    role: m.sender === "bot" ? "assistant" : "user",
+    content: m.text,
   }));
-  const botMessageId = Date.now() + 1;
+
+  // 3) placeholder bot message to stream into
+  const botId = Date.now() + 1;
+  messages.value.push({ id: botId, text: "", sender: "bot" });
 
   try {
-    messages.value.push({ id: botMessageId, text: "", sender: "bot" });
-    const currentBotMessage = messages.value.find((m) => m.id === botMessageId);
-
-    const response = await fetch(`${backendApiUrl}/v1/chat/completions`, {
+    const res = await fetch(`${backendApiUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Accept: "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        Accept: "text/event-stream",
+        "X-Persona": persona.value,            // send selected persona
       },
       body: JSON.stringify({
-        model: "mistral-medium-2508",
+        model: "mistral-medium",               // backend can override
         messages: apiMessages,
         stream: true,
       }),
     });
 
-    if (!response.ok)
-      throw new Error(`API request failed with status ${response.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status} ${body}`);
+    }
 
-    const reader = response.body.getReader();
+    const getBot = () => messages.value.find((m) => m.id === botId);
+    const ct = res.headers.get("content-type") || "";
+
+    // 4) non-stream fallback
+    if (!ct.includes("text/event-stream") || !res.body) {
+      const data = await res.json().catch(() => null);
+      getBot().text = data?.choices?.[0]?.message?.content ?? "(pas de réponse)";
+      return;
+    }
+
+    // 5) SSE streaming
+    const reader = res.body.getReader();
     const decoder = new TextDecoder();
+    let buffer = "";
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split("\n\n");
-      for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const data = line.substring(6);
-          if (data.trim() === "[DONE]") continue;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop(); // keep last incomplete part
 
-          try {
-            const parsed = JSON.parse(data);
+      for (const part of parts) {
+        if (!part.startsWith("data: ")) continue;
+        const data = part.slice(6).trim();
+        if (!data || data === "[DONE]") continue;
 
-            if (parsed.object === "custom.walking_route") {
-              routeJson.value = parsed.data; // Assign the route data
-              isMapOpen.value = true; // Automatically open the map
-              selectLeg(0); // Select the first leg by default
-            } else {
-              const content = parsed.choices[0]?.delta?.content;
-              if (content && currentBotMessage) {
-                currentBotMessage.text += content;
-              }
-            }
-          } catch (e) {
-            console.error("Could not parse stream chunk:", data, e);
+        try {
+          const j = JSON.parse(data);
+
+          if (j.object === "custom.walking_route") {
+            routeJson.value = j.data;
+            isMapOpen.value = true;
+            selectedLegIndex.value = 0;
+          } else {
+            const delta = j?.choices?.[0]?.delta?.content;
+            if (delta) getBot().text += delta;
           }
+        } catch (e) {
+          console.error("SSE parse error:", e, data);
         }
       }
     }
-  } catch (error) {
-    console.error("Error calling Mistral API:", error);
-    const errorBotMessage = messages.value.find((m) => m.id === botMessageId);
-    if (errorBotMessage) {
-      errorBotMessage.text =
-        "Hélas, une erreur est survenue lors de la communication avec le Scribe. Veuillez réessayer.";
-    }
+  } catch (err) {
+    console.error(err);
+    const b = messages.value.find((m) => m.id === botId);
+    if (b) b.text = "Hélas, une erreur est survenue. Veuillez réessayer.";
   } finally {
     await saveConversation();
     emit("conversation-updated");
   }
 };
 
-onMounted(() => {
-  loadConversation();
-});
+// Function to refresh conversation list (optional)
+const fetchConversationsList = async () => {
+  const response = await fetch(`${backendApiUrl}/v1/conversations`);
+  const data = await response.json();
+  conversations.value = data;  // Refresh the conversation list with updated data
+};
+
+onMounted(loadConversation);
 watch(() => props.uuid, loadConversation);
+
+const isRecording = ref(false);
+let mediaRecorder = null;
+let chunks = [];
+
+const toggleRecording = async () => {
+  if (!isRecording.value) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+    chunks = [];
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size) chunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+      const blob = new Blob(chunks, { type: "audio/webm" });
+      const form = new FormData();
+      form.append("file", blob, "clip.webm");
+
+      try {
+        const r = await fetch(`${backendApiUrl}/v1/audio/transcribe`, {
+          method: "POST",
+          body: form,
+        });
+        const { text } = await r.json();
+        if (text?.trim()) await handleNewMessage(text.trim());
+      } catch (e) {
+        console.error("STT failed:", e);
+      }
+    };
+
+    mediaRecorder.start();
+    isRecording.value = true;
+  } else {
+    mediaRecorder?.stop();
+    isRecording.value = false;
+  }
+};
+
+
 </script>
 
 <style scoped>
@@ -292,16 +345,6 @@ watch(() => props.uuid, loadConversation);
   opacity: 1;
 }
 
-.chat-header {
-  position: relative;
-  padding: 20px;
-  background-color: #fff;
-  color: var(--text-primary);
-  text-align: center;
-  border-bottom: 1px solid var(--border-light);
-  font-family: "Cormorant Garamond", serif;
-  flex-shrink: 0;
-}
 
 .chat-header h1 {
   margin: 0;
@@ -410,4 +453,118 @@ watch(() => props.uuid, loadConversation);
   color: white;
   border-color: var(--color-gold);
 }
+.persona-select 
+{ position: absolute;
+ right: 160px; top: 50%;
+  transform: translateY(-50%);
+  padding: 6px 10px;
+  border: 1px solid var(--border-light); 
+  border-radius: 6px; 
+  background: #fff; 
+  font-family: "Source Serif Pro", serif; }
+  /* Add position relative to the list item to ensure absolute positioning works correctly */
+.conversation-item {
+  position: relative;  /* Add this to allow absolute positioning of the 3 dots */
+}
+
+.conversation-item:hover .three-dots-menu {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  z-index: 10; /* Increase z-index for visibility */
+}
+
+/* Styling for the 3 dots menu */
+.three-dots-menu {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 18px;
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+  z-index: 1; /* Ensuring it's above other content */
+}
+.chat-header {
+  position: relative;
+  height: 120px;               /* slim banner */
+  overflow: hidden;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+
+  border-bottom: 1px solid var(--border-light);
+  padding: 12px 20px;
+  flex-shrink: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Optional subtle royal overlay */
+.chat-header::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0; height: 28px;
+  background: linear-gradient(180deg, rgba(250,246,239,0) 0%, var(--background-main) 100%);
+  pointer-events: none;
+}
+.chat-title {
+  position: relative;
+  z-index: 1;
+  font-family: "Cormorant Garamond", serif;
+  font-weight: 700;
+  font-size: 28px;
+  color: var(--bordeaux, #6A1F2B);
+  padding: 4px 10px;
+  border: 1px solid color-mix(in oklab, var(--color-gold) 40%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--ivory, #FAF6EF) 80%, transparent);
+  box-shadow: 0 6px 16px rgba(59,47,47,.08);
+}
+.new-chat-btn,
+.map-toggle-btn,
+.persona-select {
+  position: absolute;
+  top: 12px;
+  height: 34px;
+}
+
+.new-chat-btn { left: 20px; }
+.persona-select { right: 160px; }
+.map-toggle-btn { right: 20px; }
+
+@media (max-width: 640px) {
+  .chat-header { height: 90px; }
+  .chat-title  { font-size: 22px; padding: 2px 8px; }
+  .persona-select { right: 140px; }
+}
+
+.input-bar {
+  display: flex;
+  align-items: stretch;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-light);
+  background: #fff;
+  width: 100%;
+}
+
+.mic-btn {
+  appearance: none;
+  border: 1px solid var(--border-light);
+  background: #fff;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  margin-left: 8px;
+}
+.mic-btn:hover {
+  background: #f6f2e9;
+}
+
+
 </style>

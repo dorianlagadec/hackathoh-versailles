@@ -1,41 +1,90 @@
+from app.db import get_conn, init_db
+
 import json
 import os
 import time
 from contextlib import asynccontextmanager
-
+from pathlib import Path
 
 from typing import List
 import uuid  # Import the uuid library
 import httpx
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from llama_index.core.llms import ChatMessage as LlamaIndexChatMessage
 from llama_index.core.llms import MessageRole
-
+from fastapi.staticfiles import StaticFiles
 from app.schema import (
     ChatCompletionRequest,
     ChatMessage,  # Import ChatMessage
-    Conversation,  # Import new Conversation schema
     EvalCompletionAnswer,
     EvalCompletionRequest,
 )
 from src.agent import Agent
 from src.prompts import load_prompts
-from fastapi.responses import RedirectResponse
+from mistralai import Mistral
+
+transcription_model = "voxtral-mini-latest"
+
+
+def db_get_messages(conversation_id: str):
+    with get_conn() as c:
+        cur = c.execute(
+            "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id ASC",
+            (conversation_id,)
+        )
+        return [dict(role=r["role"], content=r["content"]) for r in cur.fetchall()]
+
+def db_upsert_conversation(conversation_id: str, title: str | None = None):
+    with get_conn() as c:
+        c.execute("""
+            INSERT INTO conversations (id, title, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET updated_at=CURRENT_TIMESTAMP
+        """, (conversation_id, title))
+
+def db_replace_messages(conversation_id: str, msgs: list[dict]):
+    with get_conn() as c:
+        c.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+        c.executemany(
+            "INSERT INTO messages (conversation_id, role, content) VALUES (?,?,?)",
+            [(conversation_id, m["role"], m["content"]) for m in msgs]
+        )
+        c.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (conversation_id,))
 
 load_dotenv()
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+client = Mistral(api_key = MISTRAL_API_KEY)
 SYSTEM_PROMPTS = load_prompts(
     filenames=["src/prompt_files/chat.txt", "src/prompt_files/eval.txt"]
 )
+# --- Personas ---
+PERSONA_PROMPTS = {
+    "marie_antoinette": (
+        "Tu es Marie-Antoinette. Parle avec l'élégance et la politesse de la cour de Versailles (XVIIIe siècle). "
+        "Emploie des tournures raffinées, vouvoie l’interlocuteur, reste claire, utile et factuelle."
+    ),
+    "louis_xiv": (
+        "Tu es Louis XIV. Parle d’un ton solennel et assuré, avec le « nous » de majesté à l’occasion. "
+        "Fais référence à l’étiquette et au devoir d’État, tout en restant concis et pratique."
+    ),
+}
 CONVERSATION_MEMORY_FILE = "conversation_memory.json"
 
 
 # --- Helper functions for JSON memory ---
+# --- DB helpers for conversation list ---
+def db_list_conversations():
+    with get_conn() as c:
+        cur = c.execute("""
+            SELECT id, title, updated_at
+            FROM conversations
+            ORDER BY updated_at DESC
+        """)
+        return [dict(uuid=r["id"], title=r["title"]) for r in cur.fetchall()]
 
 
 def read_memory() -> dict:
@@ -55,6 +104,29 @@ def read_memory() -> dict:
 
             return {}
 
+def db_delete_conversation(conversation_id: str):
+    with get_conn() as c:
+        # If you don't have ON DELETE CASCADE, delete messages first:
+        c.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        c.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+
+def db_rename_conversation(conversation_id: str, new_title: str):
+    new_title = (new_title or "").strip()
+    if not new_title:
+        raise ValueError("Title cannot be empty")
+
+    with get_conn() as c:
+        cur = c.execute(
+            """
+            UPDATE conversations
+            SET title = ? WHERE id = ?
+            """,
+            (new_title, conversation_id),
+        )
+        if cur.rowcount == 0:
+            # optional: create if it doesn't exist
+            raise ValueError("Conversation not fousnd")
+
 
 def write_memory(data: dict):
     """Writes the conversation memory to the JSON file."""
@@ -66,6 +138,8 @@ def write_memory(data: dict):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
+
     app.state.agent = Agent()
 
     app.state.httpx_client = httpx.AsyncClient(base_url="https://api.mistral.ai")
@@ -80,10 +154,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Proxy Mistral API (OpenAI-like)", lifespan=lifespan)
 
 
+
 origins = [
     "http://localhost:5173",  # Default Vue dev server port
     "http://127.0.0.1:5173",
     "https://hackversailles-13-deus.ngrok.app",
+    "http://192.168.1.17:5173",
     # Add any other origins you need
 ]
 
@@ -96,44 +172,49 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-def root():
-    return "Bienvenue au Proxy Mistral API. Utilisez /v1/chat/completions pour les requêtes de chat."
 
 
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(payload: ChatCompletionRequest, request: Request):
     """
-    Proxy pour l'agent LlamaIndex
+    Proxy pour l'agent LlamaIndex (avec personas)
     """
-    # Create a new session ID for each request
+    # Session
     session_id = request.headers.get("X-Session-ID") or f"session_{int(time.time())}"
 
-    # Create a new agent instance for this session
-    agent = Agent(session_id=session_id)
-    agent.agent.system_prompt = SYSTEM_PROMPTS["chat"]
+    # Persona from header/query/payload
+    persona = (
+        request.headers.get("X-Persona")
+        or request.query_params.get("persona")
+        or getattr(payload, "persona", None)
+    )
 
+    # Agent + system prompt (append persona style if any)
+    agent = Agent(session_id=session_id)
+    base_prompt = SYSTEM_PROMPTS["chat"]
+    if persona in PERSONA_PROMPTS:
+        base_prompt = base_prompt + "\n\n" + PERSONA_PROMPTS[persona]
+    agent.agent.system_prompt = base_prompt
+
+    # Extract query + build safe chat history
     try:
         query = payload.messages[-1].content
         chat_history_objects = payload.messages[:-1]
-
-        # Convertir en une liste d'objets LlamaIndexChatMessage
-        try:
-            chat_history_for_llamaindex = [
-                LlamaIndexChatMessage(
-                    role=MessageRole(
-                        msg.role
-                    ),  # Convertit le str ("user", "assistant") en Enum
-                    content=msg.content,
-                )
-                for msg in chat_history_objects
-            ]
-        except ValueError as e:
-            # Gérer le cas où le rôle n'est pas valide (par ex. "system" si non supporté)
-            print(f"Erreur lors de la conversion du rôle de message : {e}")
-        print(f"Session {session_id}: {query}")
     except (AttributeError, IndexError, TypeError):
         raise HTTPException(status_code=400, detail="Payload de messages invalide.")
+
+    chat_history_for_llamaindex = []
+    for msg in chat_history_objects:
+        try:
+            # keep only roles supported by LlamaIndex
+            if msg.role in ("user", "assistant"):
+                chat_history_for_llamaindex.append(
+                    LlamaIndexChatMessage(role=MessageRole(msg.role), content=msg.content)
+                )
+        except Exception as e:
+            print(f"Skipping message due to error: {e}")
+
+    print(f"Session {session_id} (persona={persona or 'default'}): {query}")
 
     try:
         if payload.stream:
@@ -141,13 +222,10 @@ async def proxy_chat_completions(payload: ChatCompletionRequest, request: Reques
                 query=query, chat_history=chat_history_for_llamaindex
             )
             return StreamingResponse(final_generator, media_type="text/event-stream")
-
-        else:  # NON STREAM HANDLING - Use Query Planner
+        else:
             # Try Query Planner first
             try:
                 planner_response = await agent.chat_completion_with_planner(query=query)
-                print(f"Query Planner Response: {planner_response}")
-
                 response_content = planner_response["final_answer"]
                 final_response = {
                     "id": f"cmpl-{int(time.time())}",
@@ -155,33 +233,18 @@ async def proxy_chat_completions(payload: ChatCompletionRequest, request: Reques
                     "created": int(time.time()),
                     "model": "mistral-medium-planner",
                     "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": response_content,
-                            },
-                            "finish_reason": "stop",
-                        }
+                        {"index": 0, "message": {"role": "assistant", "content": response_content}, "finish_reason": "stop"}
                     ],
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                    },
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                     "query_analysis": planner_response.get("analysis", {}),
                     "tools_used": list(planner_response.get("tool_results", {}).keys()),
-                    "processing_method": planner_response.get(
-                        "processing_method", "query_planner"
-                    ),
+                    "processing_method": planner_response.get("processing_method", "query_planner"),
+                    "persona": persona or "default",
                 }
                 return JSONResponse(content=final_response, status_code=200)
-
             except Exception as planner_error:
                 print(f"Query Planner failed: {planner_error}")
-                # Fallback to original method
                 response = await agent.chat_completion_non_stream(query=query)
-                print(response)
                 response_content = response["choices"][0]["message"]["content"]
                 final_response = {
                     "id": f"cmpl-{int(time.time())}",
@@ -189,29 +252,16 @@ async def proxy_chat_completions(payload: ChatCompletionRequest, request: Reques
                     "created": int(time.time()),
                     "model": "mistral-medium-fallback",
                     "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": response_content,
-                            },
-                            "finish_reason": "stop",
-                        }
+                        {"index": 0, "message": {"role": "assistant", "content": response_content}, "finish_reason": "stop"}
                     ],
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                    },
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                     "processing_method": "fallback",
                     "planner_error": str(planner_error),
+                    "persona": persona or "default",
                 }
                 return JSONResponse(content=final_response, status_code=200)
-
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Erreur interne du proxy: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Erreur interne du proxy: {str(e)}")
 
 
 @app.post("/v1/evaluate")
@@ -258,62 +308,95 @@ async def chat_redirect(payload: EvalCompletionRequest, request: Request):
 
 @app.get("/v1/conversations", status_code=200)
 async def get_conversations_list():
-    """Returns a list of all conversation IDs and their first user message."""
+    return JSONResponse(content=db_list_conversations())
 
-    memory = read_memory()
-
-    conv_list = []
-
-    for conv_id, data in memory.items():
-
-        first_message = "Nouvelle Conversation"
-
-        # Find the first user message for a better title
-
-        if data.get("messages"):
-
-            for msg in data["messages"]:
-
-                if msg.get("role") == "user":
-
-                    first_message = msg.get("content", first_message)
-
-                    break
-
-        conv_list.append({"uuid": conv_id, "title": first_message})
-
-    return JSONResponse(content=conv_list)
 
 
 @app.get("/v1/conversations/{conversation_id}", status_code=200)
 async def get_conversation_by_id(conversation_id: str):
-    """Returns the full message history for a given conversation UUID."""
-
-    memory = read_memory()
-
-    conversation = memory.get(conversation_id)
-
-    if not conversation:
-
+    msgs = db_get_messages(conversation_id)
+    if not msgs:
         raise HTTPException(status_code=404, detail="Conversation non trouvée.")
-
-    return JSONResponse(content=conversation.get("messages", []))
-
+    return JSONResponse(content=msgs)
 
 @app.post("/v1/conversations/{conversation_id}", status_code=200)
-async def save_conversation(conversation_id: str, payload: List[ChatMessage]):
-    """Saves or updates the message history for a given conversation UUID."""
-
+async def save_conversation(conversation_id: str, payload: List[ChatMessage] = Body(...)):
     if not payload:
+        raise HTTPException(status_code=400, detail="Le contenu des messages ne peut être vide.")
+    # use first user message as title (trim length)
+    title = next((m.content for m in payload if m.role == "user"), "Nouvelle Conversation")[:80]
+    db_upsert_conversation(conversation_id, title=title)
+    db_replace_messages(conversation_id, [m.dict() for m in payload])
+    return JSONResponse(content={"status": "success", "uuid": conversation_id})
 
+@app.delete("/v1/conversations/{conversation_id}", status_code=200)
+async def delete_conversation(conversation_id: str):
+    try:
+        db_delete_conversation(conversation_id)
+        return JSONResponse({"status": "success"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+from pydantic import BaseModel
+
+class RenamePayload(BaseModel):
+    title: str
+
+@app.patch("/v1/conversations/{conversation_id}", status_code=200)
+async def rename_conversation(conversation_id: str, payload: RenamePayload):
+    try:
+        db_rename_conversation(conversation_id, payload.title)
+        return {"status": "success"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+SPA_DIR = BASE_DIR / "front-chat-versaille" / "dist"
+
+if not SPA_DIR.exists():
+    raise RuntimeError(f"Directory '{SPA_DIR}' does not exist")
+
+@app.post("/v1/audio/transcribe")
+async def transcribe_audio(request: Request, file: UploadFile = File(...)):
+    if not MISTRAL_API_KEY:
+        raise HTTPException(status_code=500, detail="MISTRAL_API_KEY is not configured.")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Le fichier audio est vide.")
+
+    filename = file.filename or "audio.webm"
+    content_type = file.content_type or "audio/webm"
+
+    http_client: httpx.AsyncClient = request.app.state.httpx_client
+    try:
+        response = await http_client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {MISTRAL_API_KEY}"},
+            data={"model": transcription_model},
+            files={"file": (filename, contents, content_type)},
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Impossible de contacter Mistral: {exc}") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
         raise HTTPException(
-            status_code=400, detail="Le contenu des messages ne peut être vide."
+            status_code=502, detail="Réponse inattendue de Mistral lors de la transcription."
+        ) from exc
+
+    if response.status_code >= 400:
+        detail = payload.get("message") or payload
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Erreur Mistral lors de la transcription: {detail}",
         )
 
-    memory = read_memory()
+    text = payload.get("text")
+    if not text:
+        raise HTTPException(status_code=502, detail="Mistral n'a pas renvoyé de texte transcrit.")
 
-    memory[conversation_id] = {"messages": [msg.dict() for msg in payload]}
+    return {"text": text.strip()}
 
-    write_memory(memory)
-
-    return JSONResponse(content={"status": "success", "uuid": conversation_id})
+app.mount("/", StaticFiles(directory=str(SPA_DIR), html=True), name="spa")
